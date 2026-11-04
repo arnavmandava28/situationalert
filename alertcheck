@@ -1,0 +1,166 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "fb_gfx.h"
+#include "fd_forward.h"
+#include "ESP_I2S.h" // For built-in PDM microphone
+
+#define CAMERA_MODEL_XIAO_ESP32S3
+#include "camera_pins.h"
+
+// Enter your Wi-Fi credentials
+const char* ssid = "CENSORED";
+const char* password = "CENSORED";
+
+// Pin connected to your LED or relay module
+const int LIGHT_PIN = 4; 
+
+// Threshold Rules
+const int PEOPLE_THRESHOLD = 6;    // More than 6 people (> 6)
+const float DB_THRESHOLD = 70.0;   // 70 dB or above (>= 70)
+
+unsigned long lastCheckTime = 0;
+const long checkInterval = 2000;   // Check every 2 seconds
+
+// PDM Mic setup for XIAO ESP32S3 Sense
+I2SClass I2S;
+const int SAMPLE_RATE = 16000;
+
+static int face_detect_enabled = 1;
+static mtmn_config_t mtmn_config = {0};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  
+  pinMode(LIGHT_PIN, OUTPUT);
+  digitalWrite(LIGHT_PIN, LOW);
+
+  // Initialize PDM Microphone on pins 42 (clock) and 41 (data)
+  I2S.setAllPins(-1, 42, 41, -1, -1);
+  if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, 16)) {
+    // Fails silently for standalone operation if mic errors
+  }
+
+  // Camera configuration
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  
+  config.xclk_freq_hz = 10000000; // 10MHz clock for stability
+  config.frame_size = FRAMESIZE_QVGA; 
+  config.pixel_format = PIXFORMAT_RGB565; // Required for face detection
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+
+  if (!psramFound()) {
+    // Fallback or warning
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    return;
+  }
+
+  mtmn_config = matmn_config_default();
+
+  WiFi.setTxPower(WIFI_POWER_15dBm); // Lower power to reduce overheating
+  WiFi.begin(ssid, password);
+  
+  // Wait up to 10 seconds for Wi-Fi connection in standalone boot
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < 10000)) {
+    delay(500);
+  }
+}
+
+float readDecibelLevel() {
+  long sumSquare = 0;
+  int sampleCount = 512;
+  int validSamples = 0;
+
+  for (int i = 0; i < sampleCount; i++) {
+    int16_t sample = (int16_t)I2S.read();
+    if (sample != -1 && sample != 0) {
+      sumSquare += (long)sample * sample;
+      validSamples++;
+    }
+  }
+
+  if (validSamples == 0) return 0;
+  
+  float rms = sqrt((float)sumSquare / validSamples);
+  if (rms < 1.0) rms = 1.0;
+  
+  return 20.0 * log10(rms);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastCheckTime >= checkInterval) {
+    lastCheckTime = currentMillis;
+
+    // 1. Read Sound Level
+    float currentDB = readDecibelLevel();
+    bool soundTriggered = (currentDB >= DB_THRESHOLD);
+
+    // 2. Read Face Detection Count
+    int detectedFaces = 0;
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
+      if (image_matrix) {
+        fmt2rgb888(fb->buf, fb->len, PIXFORMAT_RGB565, image_matrix->item);
+        box_array_t *net_boxes = face_detect(image_matrix, &mtmn_config);
+        
+        if (net_boxes != NULL) {
+          detectedFaces = net_boxes->len;
+          free(net_boxes->score);
+          free(net_boxes->box);
+          free(net_boxes->to_del);
+          free(net_boxes->get_to_del);
+          free(net_boxes);
+        }
+        dl_matrix3du_free(image_matrix);
+      }
+      esp_camera_fb_return(fb);
+    }
+
+    bool peopleTriggered = (detectedFaces > PEOPLE_THRESHOLD);
+
+    // 3. Control Light Logic
+    if (peopleTriggered && soundTriggered) {
+      // Both conditions met -> Flashing Light pattern
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LIGHT_PIN, HIGH);
+        delay(150);
+        digitalWrite(LIGHT_PIN, LOW);
+        delay(150);
+      }
+    } else if (peopleTriggered || soundTriggered) {
+      // One condition met -> Solid Light
+      digitalWrite(LIGHT_PIN, HIGH);
+    } else {
+      // Neither condition met -> OFF
+      digitalWrite(LIGHT_PIN, LOW);
+    }
+  }
+}
